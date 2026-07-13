@@ -185,12 +185,4 @@ The `--smoke` and `--synthetic` flags generate internally-consistent synthetic d
 
 This repository accompanies a research manuscript. For academic use, please cite the accompanying paper.
 
-## Citation
-
-```
-@article{amofs,
-  title   = {AMOFS: An Adversary-Aware Multi-Objective Evolutionary Feature Selection Framework with Convergence Guarantees for Malicious URL Detection},
-  journal = {[To be filled]},
-  year    = {2024}
-}
 ```
