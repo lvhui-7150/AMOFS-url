@@ -1,0 +1,449 @@
+{
+  "dataset": {
+    "name": "urlhaus_bench",
+    "snapshot": "2026-06-25",
+    "n_urls": 1000,
+    "malicious_pct": 50.0,
+    "n_features": 38,
+    "windows": 5
+  },
+  "config": {
+    "pop_size": 10,
+    "generations": 5,
+    "n_runs": 1,
+    "ablation_runs": 30,
+    "base_seed": 20240101,
+    "knn_k": 5,
+    "n_windows": 5,
+    "mec_delta": 0.05,
+    "attack_budgets": [
+      1.0,
+      2.0,
+      3.0,
+      4.0,
+      5.0
+    ],
+    "test_size": 0.2,
+    "val_size": 0.2,
+    "amofs": {
+      "alpha": 2.0,
+      "beta": 1.5,
+      "pc_min": 0.6,
+      "pc_max": 0.95,
+      "eta_min": 0.02,
+      "eta_max": 0.4,
+      "lam": 0.5,
+      "eps": 0.05,
+      "use_ancf": true,
+      "use_agdm": true
+    }
+  },
+  "metrics": {
+    "NSGA-II": {
+      "hv_mean": 0.0082,
+      "hv_std": 0.0,
+      "igd_mean": 0.07213335122949813,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.32736842105263153,
+      "stability_std": 0.0,
+      "features_mean": 9.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.0037510000038309954,
+      "latency_ms_std": 0.0
+    },
+    "MOEA/D": {
+      "hv_mean": 0.0076,
+      "hv_std": 0.0,
+      "igd_mean": 0.10338976717884546,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.4597630439735704,
+      "stability_std": 0.0,
+      "features_mean": 13.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.005631000003631925,
+      "latency_ms_std": 0.0
+    },
+    "SPEA2": {
+      "hv_mean": 0.0094,
+      "hv_std": 0.0,
+      "igd_mean": 0.07780396256384135,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.33120796061299496,
+      "stability_std": 0.0,
+      "features_mean": 12.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.005681000002368819,
+      "latency_ms_std": 0.0
+    },
+    "BPSO": {
+      "hv_mean": 0.0068,
+      "hv_std": 0.0,
+      "igd_mean": 0.11508912248032825,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.4122807017543859,
+      "stability_std": 0.0,
+      "features_mean": 15.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.003463500006546383,
+      "latency_ms_std": 0.0
+    },
+    "BGWO": {
+      "hv_mean": 0.0082,
+      "hv_std": 0.0,
+      "igd_mean": 0.05413003630527696,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.4597630439735704,
+      "stability_std": 0.0,
+      "features_mean": 13.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.003427499996178085,
+      "latency_ms_std": 0.0
+    },
+    "AMOFS": {
+      "hv_mean": 0.0082,
+      "hv_std": 0.0,
+      "igd_mean": 0.08719418027799664,
+      "igd_std": 0.0,
+      "bacc_mean": 1.0,
+      "bacc_std": 0.0,
+      "f1_mean": 1.0,
+      "f1_std": 0.0,
+      "auc_mean": 1.0,
+      "auc_std": 0.0,
+      "stability_mean": 0.3197311460469354,
+      "stability_std": 0.0,
+      "features_mean": 10.0,
+      "features_std": 0.0,
+      "latency_ms_mean": 0.005495000004884787,
+      "latency_ms_std": 0.0
+    }
+  },
+  "raw_runs": {
+    "NSGA-II": {
+      "hv": [
+        0.0082
+      ],
+      "igd": [
+        0.07213335122949813
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.32736842105263153
+      ],
+      "features": [
+        9.0
+      ],
+      "latency_ms": [
+        0.0037510000038309954
+      ],
+      "evasion": [
+        [
+          0.0,
+          3.0,
+          3.0,
+          40.0,
+          40.0
+        ]
+      ]
+    },
+    "MOEA/D": {
+      "hv": [
+        0.0076
+      ],
+      "igd": [
+        0.10338976717884546
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.4597630439735704
+      ],
+      "features": [
+        13.0
+      ],
+      "latency_ms": [
+        0.005631000003631925
+      ],
+      "evasion": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          54.0,
+          54.0
+        ]
+      ]
+    },
+    "SPEA2": {
+      "hv": [
+        0.0094
+      ],
+      "igd": [
+        0.07780396256384135
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.33120796061299496
+      ],
+      "features": [
+        12.0
+      ],
+      "latency_ms": [
+        0.005681000002368819
+      ],
+      "evasion": [
+        [
+          0.0,
+          96.0,
+          96.0,
+          96.0,
+          100.0
+        ]
+      ]
+    },
+    "BPSO": {
+      "hv": [
+        0.0068
+      ],
+      "igd": [
+        0.11508912248032825
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.4122807017543859
+      ],
+      "features": [
+        15.0
+      ],
+      "latency_ms": [
+        0.003463500006546383
+      ],
+      "evasion": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          3.0
+        ]
+      ]
+    },
+    "BGWO": {
+      "hv": [
+        0.0082
+      ],
+      "igd": [
+        0.05413003630527696
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.4597630439735704
+      ],
+      "features": [
+        13.0
+      ],
+      "latency_ms": [
+        0.003427499996178085
+      ],
+      "evasion": [
+        [
+          0.0,
+          88.0,
+          88.0,
+          88.0,
+          95.0
+        ]
+      ]
+    },
+    "AMOFS": {
+      "hv": [
+        0.0082
+      ],
+      "igd": [
+        0.08719418027799664
+      ],
+      "bacc": [
+        1.0
+      ],
+      "f1": [
+        1.0
+      ],
+      "auc": [
+        1.0
+      ],
+      "stability": [
+        0.3197311460469354
+      ],
+      "features": [
+        10.0
+      ],
+      "latency_ms": [
+        0.005495000004884787
+      ],
+      "evasion": [
+        [
+          0.0,
+          95.0,
+          95.0,
+          100.0,
+          100.0
+        ]
+      ]
+    }
+  },
+  "evasion": {
+    "NSGA-II": [
+      0.0,
+      3.0,
+      3.0,
+      40.0,
+      40.0
+    ],
+    "MOEA/D": [
+      0.0,
+      0.0,
+      0.0,
+      54.0,
+      54.0
+    ],
+    "SPEA2": [
+      0.0,
+      96.0,
+      96.0,
+      96.0,
+      100.0
+    ],
+    "BPSO": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      3.0
+    ],
+    "BGWO": [
+      0.0,
+      88.0,
+      88.0,
+      88.0,
+      95.0
+    ],
+    "AMOFS": [
+      0.0,
+      95.0,
+      95.0,
+      100.0,
+      100.0
+    ]
+  },
+  "hv_significance": {
+    "NSGA-II": {
+      "p_raw": 1.0,
+      "p_adj": 1.0,
+      "reject": false,
+      "rank_biserial": 0.0,
+      "a12": 0.5
+    },
+    "MOEA/D": {
+      "p_raw": 1.0,
+      "p_adj": 1.0,
+      "reject": false,
+      "rank_biserial": 1.0,
+      "a12": 1.0
+    },
+    "SPEA2": {
+      "p_raw": 1.0,
+      "p_adj": 1.0,
+      "reject": false,
+      "rank_biserial": -1.0,
+      "a12": 0.0
+    },
+    "BPSO": {
+      "p_raw": 1.0,
+      "p_adj": 1.0,
+      "reject": false,
+      "rank_biserial": 1.0,
+      "a12": 1.0
+    },
+    "BGWO": {
+      "p_raw": 1.0,
+      "p_adj": 1.0,
+      "reject": false,
+      "rank_biserial": 0.0,
+      "a12": 0.5
+    }
+  },
+  "ablation": {},
+  "outputs": {
+    "tables": "C:\\Users\\Administrator\\Desktop\\\u8bba\u6587\\\u6076\u610fURL\u68c0\u6d4b\\code\\results\\tables",
+    "figures": "C:\\Users\\Administrator\\Desktop\\\u8bba\u6587\\\u6076\u610fURL\u68c0\u6d4b\\code\\results\\figures"
+  }
+}
