@@ -1,9 +1,19 @@
-"""The AMOFS algorithm: ANCF schedule + Archive-Guided Discrete Mutation.
+"""AMOFS: archive-progress adaptive schedule (ANCF) + Archive-Guided Discrete
+Mutation (AGDM) on top of an elitist, NSGA-II-style environmental selection.
 
-Implements Algorithm 1 of the manuscript. Returns the final archive (mask
-matrix and objective matrix) plus a per-generation hypervolume log and the
-per-feature archive selection-frequency log (used to validate the guided-drift
-assumption empirically).
+ANCF.  Let HV_t be the archive hypervolume after generation t and
+    kappa_t = clip( (HV_t - HV_{t-w}) / (HV_t - HV_0 + 1e-9), 0, 1 )
+the share of the total hypervolume gain obtained in the last w generations
+(kappa_t = 1 while the archive is still improving, -> 0 once it stagnates).
+The convergence factor is
+    a(t) = 2 (1 - t/T)^alpha * kappa_t^beta,
+    p_c(t) = pc_min + (pc_max - pc_min)(1 - a/2),
+    eta(t) = eta_min + (eta_max - eta_min)(a/2).
+
+AGDM.  With archive selection frequency s_i and crowding-weighted frequency
+c_i, r_i = lam*s_i + (1-lam)*c_i and
+    p_on_i  = clip(eta * r_i,       eta*eps, eta*(1-eps)),
+    p_off_i = clip(eta * (1 - r_i), eta*eps, eta*(1-eps)).
 """
 from __future__ import annotations
 
@@ -14,132 +24,130 @@ import numpy as np
 
 from .config import AMOFSParams
 from .indicators import hypervolume
-from .nsga_common import (archive_update, crowding_distance,
-                          environmental_selection, normalised_crowding)
-from .objectives import Evaluator
+from .nsga_common import (Archive, crowding_distance, environmental_selection,
+                          fast_non_dominated_sort, normalised_crowding)
 
 
 @dataclass
 class RunResult:
     arch_X: np.ndarray
     arch_F: np.ndarray
-    hv_log: List[float] = field(default_factory=list)
+    hv_log: List[float] = field(default_factory=list)          # fast HV per generation
     sel_freq_log: List[np.ndarray] = field(default_factory=list)
+    a_log: List[float] = field(default_factory=list)
+    eta_log: List[float] = field(default_factory=list)
+    archive_size_log: List[int] = field(default_factory=list)
+    truncations: int = 0
+    n_evaluations: int = 0
 
 
-def _binary_tournament(F: np.ndarray, rng) -> int:
-    i, j = rng.integers(0, F.shape[0], size=2)
-    # prefer the one that dominates; otherwise random (cheap proxy of rank)
-    if np.all(F[i] <= F[j]) and np.any(F[i] < F[j]):
-        return int(i)
-    if np.all(F[j] <= F[i]) and np.any(F[j] < F[i]):
-        return int(j)
-    return int(i if rng.random() < 0.5 else j)
+def rank_and_crowding(F: np.ndarray):
+    rank = np.empty(F.shape[0], dtype=int)
+    cd = np.empty(F.shape[0], dtype=float)
+    for r, front in enumerate(fast_non_dominated_sort(F)):
+        rank[front] = r
+        cd[front] = crowding_distance(F[front])
+    return rank, cd
 
 
-def _uniform_crossover(p1, p2, pc, rng):
+def tournament(rank, cd, rng) -> int:
+    i, j = rng.integers(0, rank.shape[0], size=2)
+    if rank[i] != rank[j]:
+        return int(i if rank[i] < rank[j] else j)
+    return int(i if cd[i] >= cd[j] else j)
+
+
+def uniform_crossover(p1, p2, pc, rng):
     if rng.random() > pc:
         return p1.copy()
     swap = rng.random(p1.shape[0]) < 0.5
-    child = np.where(swap, p1, p2)
-    return child.astype(np.int8)
+    return np.where(swap, p1, p2).astype(np.int8)
 
 
-def _ancf(t, t_max, hv_now, hv_ref, alpha, beta):
-    g = (1.0 - t / t_max) ** alpha
-    h = (1.0 - min(hv_now / (hv_ref + 1e-12), 1.0)) ** beta
-    return 2.0 * g * h
-
-
-def _generation_schedule(t, t_max, alpha):
-    return 2.0 * (1.0 - t / t_max) ** alpha
-
-
-def _agdm(child, s, c, eta, lam, eps, rng):
-    """Archive-Guided Discrete Mutation (Eqs. p_on / p_off, with clipping)."""
-    on_score = lam * s + (1 - lam) * c
-    off_score = lam * (1 - s) + (1 - lam) * (1 - c)
-    p_on = np.clip(eta * on_score, eta * eps, eta * (1 - eps))
-    p_off = np.clip(eta * off_score, eta * eps, eta * (1 - eps))
-
-    r = rng.random(child.shape[0])
+def agdm(child, r, eta, eps, rng):
+    lo, hi = eta * eps, eta * (1.0 - eps)
+    p_on = np.clip(eta * r, lo, hi)
+    p_off = np.clip(eta * (1.0 - r), lo, hi)
+    u = rng.random(child.shape[0])
     out = child.copy()
-    off_mask = child == 1
-    on_mask = child == 0
-    out[on_mask & (r < p_on)] = 1
-    out[off_mask & (r < p_off)] = 0
+    out[(child == 0) & (u < p_on)] = 1
+    out[(child == 1) & (u < p_off)] = 0
     return out
 
 
-def _uniform_bitflip(child, eta, rng):
+def uniform_bitflip(child, eta, rng):
+    """Unguided counterpart of AGDM with the same expected number of flips."""
     rate = min(max(eta * 0.5, 1.0 / child.shape[0]), 0.5)
     out = child.copy()
-    flip = rng.random(child.shape[0]) < rate
-    out[flip] ^= 1
+    out[rng.random(child.shape[0]) < rate] ^= 1
     return out
 
 
-def run_amofs(ev: Evaluator, n_features: int, pop_size: int, generations: int,
-              params: AMOFSParams, seed: int = 0,
-              hv_ref_init: float = 0.5) -> RunResult:
-    rng = np.random.default_rng(seed)
+def ensure_nonempty(child, rng):
+    if child.sum() == 0:
+        child[rng.integers(0, child.shape[0])] = 1
+    return child
 
-    # initialise population (avoid all-zero masks)
-    P = (rng.random((pop_size, n_features)) < 0.3).astype(np.int8)
-    P[P.sum(axis=1) == 0, 0] = 1
+
+def run_amofs(ev, n_features: int, pop_size: int, generations: int, params: AMOFSParams,
+              seed: int = 0, archive_cap: int = 0, init_density: float = 0.3) -> RunResult:
+    rng = np.random.default_rng(seed)
+    P = (rng.random((pop_size, n_features)) < init_density).astype(np.int8)
+    for row in P:
+        ensure_nonempty(row, rng)
     FP = ev.evaluate_population(P)
 
-    arch_X, arch_F = archive_update(np.empty((0, n_features), np.int8),
-                                    np.empty((0, 4)), P, FP)
-
-    hv_ref = max(hv_ref_init, hypervolume(arch_F))
-    res = RunResult(arch_X=arch_X, arch_F=arch_F)
+    arch = Archive(n_features, FP.shape[1], cap=archive_cap)
+    arch.update(P, FP)
+    hv0 = hypervolume(arch.F, exact=False)
+    hv_hist = [hv0]
+    res = RunResult(arch_X=arch.X, arch_F=arch.F)
+    w = max(1, int(params.window))
 
     for t in range(1, generations + 1):
-        hv_now = hypervolume(arch_F)
-        hv_ref = max(hv_ref, hv_now)
+        # ---- ANCF -----------------------------------------------------
+        decay = (1.0 - t / generations) ** params.alpha
         if params.use_ancf:
-            a = _ancf(t, generations, hv_now, hv_ref,
-                      params.alpha, params.beta)
+            hv_now, hv_prev = hv_hist[-1], hv_hist[max(0, len(hv_hist) - 1 - w)]
+            kappa = (hv_now - hv_prev) / (hv_now - hv0 + 1e-9) if t > w else 1.0
+            kappa = float(np.clip(kappa, 0.0, 1.0))
+            a = 2.0 * decay * kappa ** params.beta
         else:
-            a = _generation_schedule(t, generations, params.alpha)
-        pc = params.pc_min + (params.pc_max - params.pc_min) * (1 - a / 2)
-        eta = params.eta_min + (params.eta_max - params.eta_min) * (a / 2)
+            a = 2.0 * decay
+        pc = params.pc_min + (params.pc_max - params.pc_min) * (1.0 - a / 2.0)
+        eta = params.eta_min + (params.eta_max - params.eta_min) * (a / 2.0)
 
-        # archive statistics for AGDM
-        if arch_X.shape[0] > 0:
-            s = arch_X.mean(axis=0)
-            cd = normalised_crowding(arch_F)
-            denom = cd.sum() + 1e-12
-            c = (arch_X * cd[:, None]).sum(axis=0) / denom
+        # ---- archive statistics for AGDM ---------------------------------
+        if len(arch) > 0:
+            s = arch.X.mean(axis=0)
+            cdn = normalised_crowding(arch.F)
+            c = (arch.X * cdn[:, None]).sum(axis=0) / (cdn.sum() + 1e-12)
         else:
-            s = np.full(n_features, 0.5)
-            c = np.full(n_features, 0.5)
+            s = c = np.full(n_features, 0.5)
+        r = params.lam * s + (1.0 - params.lam) * c
 
-        # generate offspring
+        # ---- variation ------------------------------------------------
+        rank, cd = rank_and_crowding(FP)
         Q = np.empty_like(P)
         for j in range(pop_size):
-            i1 = _binary_tournament(FP, rng)
-            i2 = _binary_tournament(FP, rng)
-            child = _uniform_crossover(P[i1], P[i2], pc, rng)
-            if params.use_agdm:
-                child = _agdm(child, s, c, eta, params.lam, params.eps, rng)
-            else:
-                child = _uniform_bitflip(child, eta, rng)
-            if child.sum() == 0:
-                child[rng.integers(0, n_features)] = 1
-            Q[j] = child
+            p1, p2 = P[tournament(rank, cd, rng)], P[tournament(rank, cd, rng)]
+            child = uniform_crossover(p1, p2, pc, rng)
+            child = agdm(child, r, eta, params.eps, rng) if params.use_agdm else uniform_bitflip(child, eta, rng)
+            Q[j] = ensure_nonempty(child, rng)
         FQ = ev.evaluate_population(Q)
 
-        # environmental selection on combined population
-        XU = np.vstack([P, Q])
-        FU = np.vstack([FP, FQ])
-        P, FP = environmental_selection(XU, FU, pop_size)
+        # ---- selection + archive ----------------------------------------
+        P, FP = environmental_selection(np.vstack([P, Q]), np.vstack([FP, FQ]), pop_size)
+        arch.update(Q, FQ)
 
-        arch_X, arch_F = archive_update(arch_X, arch_F, P, FP)
+        hv_hist.append(hypervolume(arch.F, exact=False))
+        res.hv_log.append(hv_hist[-1])
+        res.sel_freq_log.append(arch.X.mean(axis=0))
+        res.a_log.append(a)
+        res.eta_log.append(eta)
+        res.archive_size_log.append(len(arch))
 
-        res.hv_log.append(hypervolume(arch_F))
-        res.sel_freq_log.append(arch_X.mean(axis=0) if arch_X.shape[0] else s)
-
-    res.arch_X, res.arch_F = arch_X, arch_F
+    res.arch_X, res.arch_F = arch.X, arch.F
+    res.truncations = arch.truncations
+    res.n_evaluations = getattr(ev, "n_evaluations", 0)
     return res

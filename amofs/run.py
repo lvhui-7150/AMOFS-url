@@ -1,21 +1,15 @@
-"""End-to-end experiment driver.
+"""End-to-end experiment driver (paired design: every method sees the same
+seed, split, evaluator and attack samples).
 
-Usage
------
     python -m amofs.run --smoke
-    python -m amofs.prepare_data --dataset urlhaus_majestic --limit-per-class 2500
-    python -m amofs.run --dataset data/processed/urlhaus_majestic.csv --name URLhausMajestic
+    python -m amofs.run --dataset data/processed/urlhaus_hn.csv --tag UH --display "URLhaus--HN" --profile fast
+    python -m amofs.run --dataset ... --tag UH --aggregate-only      # re-export tables from saved seeds
 
-Outputs (under results/):
-    tables/main_<name>.tex          main comparison (HV/IGD/BACC/F1)
-    tables/extended_<name>.tex      AUC/stability/features/latency
-    tables/evasion_<name>.tex       evasion versus attacker budget
-    tables/ablation_<name>.tex      AMOFS ablation
-    tables/dataset_<name>.tex       dataset row for the manuscript
-    tables/hyper_<name>.tex         selected hyperparameters
-    tables/stats_hv_<name>.tex      AMOFS significance versus baselines on HV
-    figures/convergence_<name>.png  HV convergence and AGDM evidence
-    results/<name>_summary.json     raw aggregated numbers
+Outputs under results/<tag>/:
+    seeds/seed_<s>.json        raw per-seed results (resumable)
+    ablation/seed_<s>.json     raw per-seed ablation results
+    summary.json               aggregated numbers used by export/make_figures
+    tables/*.tex               LaTeX fragments (\\input{} them)
 """
 from __future__ import annotations
 
@@ -24,388 +18,359 @@ import json
 import os
 import time
 from copy import deepcopy
-from dataclasses import asdict
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
+from joblib import Parallel, delayed
 from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
 
 from . import export
 from .amofs import run_amofs
-from .attack import evasion_curve
-from .baselines import BASELINES
-from .config import ExperimentConfig
-from .data import Dataset, load_dataset, make_synthetic
-from .indicators import build_reference_front, hypervolume, igd
-from .objectives import Evaluator
-from .stats import compare_against_baselines
+from .attack import EvasionAttacker, auec
+from .baselines import BASELINES, METHOD_ORDER
+from .config import PROFILES, ExperimentConfig
+from .data import Dataset, chronological_split, load_dataset, make_synthetic
+from .indicators import build_reference_front, hv_backend, hypervolume, igd
+from .objectives import Evaluator, ObjectiveDropEvaluator
+from .stats import compare_against_baselines, friedman
 
-RESULTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "results"))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+RESULTS = os.path.join(ROOT, "results")
 
-
-class ObjectiveDropEvaluator:
-    """Wrapper that disables selected objectives during search only."""
-
-    def __init__(self, base: Evaluator, disabled: Iterable[int]):
-        self.base = base
-        self.disabled = tuple(disabled)
-        self.scaler = base.scaler
-
-    def evaluate(self, mask: np.ndarray) -> np.ndarray:
-        values = self.base.evaluate(mask)
-        for idx in self.disabled:
-            values[idx] = 0.0
-        return values
-
-    def evaluate_population(self, masks: np.ndarray) -> np.ndarray:
-        return np.vstack([self.evaluate(mask) for mask in masks])
+ABLATION_VARIANTS = [
+    ("Full AMOFS", dict(), ()),
+    ("w/o ANCF", dict(use_ancf=False), ()),
+    ("w/o AGDM", dict(use_agdm=False), ()),
+    ("w/o ANCF \\& AGDM", dict(use_ancf=False, use_agdm=False), ()),
+    ("w/o $f_{\\mathrm{rob}}$", dict(), (2,)),
+    ("w/o $f_{\\mathrm{stab}}$", dict(), (3,)),
+    ("w/o $f_{\\mathrm{rob}}$, $f_{\\mathrm{stab}}$", dict(), (2, 3)),
+]
 
 
-def _split(ds: Dataset, cfg: ExperimentConfig, seed: int):
-    Xtr, Xte, ytr, yte = train_test_split(
-        ds.X, ds.y, test_size=cfg.test_size, random_state=seed, stratify=ds.y)
-    val_frac = cfg.val_size / (1 - cfg.test_size)
-    Xtr, Xva, ytr, yva = train_test_split(
-        Xtr, ytr, test_size=val_frac, random_state=seed, stratify=ytr)
-    return Xtr, Xva, Xte, ytr, yva, yte
+# ---------------------------------------------------------------------------
+def operating_point(aX: np.ndarray, aF: np.ndarray, ref: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Balanced operating point: argmin of the sum of range-normalised objectives.
+
+    Normalisation uses the union reference front of the run so that every
+    method is scored on the same scale.  Also returns the accuracy-first point.
+    """
+    lo, hi = ref.min(axis=0), ref.max(axis=0)
+    span = np.where(hi - lo > 1e-12, hi - lo, 1.0)
+    score = ((aF - lo) / span).sum(axis=1)
+    balanced = aX[int(np.argmin(score))]
+    # accuracy-first: minimal f_err, ties broken by fewer features
+    order = np.lexsort((aF[:, 1], aF[:, 0]))
+    return balanced.astype(np.int8), aX[order[0]].astype(np.int8)
 
 
-def _knee_subset(aX: np.ndarray, aF: np.ndarray, n_features: int) -> np.ndarray:
-    if aX.shape[0] == 0:
-        return np.ones(n_features, dtype=np.int8)
-    scores = aF.sum(axis=1)
-    return aX[int(np.argmin(scores))].astype(np.int8)
-
-
-def _downstream_scores(Xtr, ytr, Xte, yte, mask, seed: int) -> dict:
-    sel = np.flatnonzero(mask)
-    if sel.size == 0:
-        return dict(bacc=0.5, f1=0.0, auc=0.5, latency_ms=0.0)
-    clf = GradientBoostingClassifier(random_state=seed)
-    clf.fit(Xtr[:, sel], ytr)
-    start = time.perf_counter()
-    pred = clf.predict(Xte[:, sel])
-    elapsed = time.perf_counter() - start
-    if hasattr(clf, "predict_proba"):
-        score = clf.predict_proba(Xte[:, sel])[:, 1]
-    else:
-        score = pred
+def _detector_metrics(clf, Xte_sel, yte) -> dict:
+    pred = clf.predict(Xte_sel)
     try:
-        auc = float(roc_auc_score(yte, score))
+        auc = float(roc_auc_score(yte, clf.predict_proba(Xte_sel)[:, 1]))
     except ValueError:
-        auc = 0.5
-    return dict(
-        bacc=float(balanced_accuracy_score(yte, pred)),
-        f1=float(f1_score(yte, pred, zero_division=0)),
-        auc=auc,
-        latency_ms=float(1000.0 * elapsed / max(len(yte), 1)),
-    )
+        auc = float("nan")
+    return dict(bacc=float(balanced_accuracy_score(yte, pred)),
+                f1=float(f1_score(yte, pred, zero_division=0)), auc=auc)
 
 
-def _standardised_test(ev: Evaluator, Xtr, Xte):
-    return ev.scaler.transform(Xtr), ev.scaler.transform(Xte)
-
-
-def _dataset_summary(ds: Dataset, cfg: ExperimentConfig) -> dict:
-    snapshot = "n/a"
-    if ds.timestamps is not None and len(ds.timestamps):
-        valid = ds.timestamps[np.isfinite(ds.timestamps.astype(float))]
-        if valid.size:
-            ts = pd.to_datetime(int(valid.max()), unit="ns", errors="coerce")
-            if not pd.isna(ts):
-                snapshot = str(ts.date())
-    mal = int(ds.y.sum())
-    return dict(
-        name=ds.name,
-        snapshot=snapshot,
-        n_urls=int(len(ds.y)),
-        malicious_pct=float(100.0 * mal / max(len(ds.y), 1)),
-        n_features=int(ds.n_features),
-        windows=int(cfg.n_windows),
-    )
-
-
-def _selected_hyperparameters(cfg: ExperimentConfig) -> dict:
-    values = asdict(cfg.amofs)
-    values.update(pop_size=cfg.pop_size, generations=cfg.generations)
-    return values
-
-
-def _evaluate_archive(ev: Evaluator, aX: np.ndarray) -> np.ndarray:
-    if aX.shape[0] == 0:
-        return np.empty((0, 4), dtype=float)
-    return ev.evaluate_population(aX)
-
-
-def run_experiment(ds: Dataset, cfg: ExperimentConfig, run_ablation: bool = True):
-    methods = list(BASELINES.keys()) + ["AMOFS"]
-    metric_keys = ("hv", "igd", "bacc", "f1", "auc", "stability", "features", "latency_ms")
-    store = {m: {key: [] for key in metric_keys} | {"evasion": []} for m in methods}
-    hv_logs = {m: [] for m in methods}
-    amofs_selfreq_logs: List[np.ndarray] = []
-
-    for run_idx in range(cfg.n_runs):
-        seed = cfg.base_seed + run_idx
-        Xtr, Xva, Xte, ytr, yva, yte = _split(ds, cfg, seed)
-        ev = Evaluator(ds, Xtr, ytr, Xva, yva, k=cfg.knn_k,
-                       n_windows=cfg.n_windows, mec_delta=cfg.mec_delta)
-
-        run_fronts: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-
-        for name, fn in BASELINES.items():
-            aX, aF, log = fn(ev, ds.n_features, cfg.pop_size,
-                             cfg.generations, seed=seed)
-            run_fronts[name] = (aX, aF)
-            hv_logs[name].append(log)
-
-        res = run_amofs(ev, ds.n_features, cfg.pop_size, cfg.generations,
-                        cfg.amofs, seed=seed)
-        run_fronts["AMOFS"] = (res.arch_X, res.arch_F)
-        hv_logs["AMOFS"].append(res.hv_log)
-        if res.sel_freq_log:
-            amofs_selfreq_logs.append(np.vstack(res.sel_freq_log))
-
-        ref = build_reference_front([aF for _, aF in run_fronts.values()])
-        Xtr_s, Xte_s = _standardised_test(ev, Xtr, Xte)
-
-        for name, (aX, aF) in run_fronts.items():
-            knee = _knee_subset(aX, aF, ds.n_features)
-            downstream = _downstream_scores(Xtr_s, ytr, Xte_s, yte, knee, seed)
-            curve = evasion_curve(Xtr_s, ytr, Xte_s, yte, knee, ds.costs,
-                                  cfg.attack_budgets, seed=seed)
-            store[name]["hv"].append(hypervolume(aF))
-            store[name]["igd"].append(igd(aF, ref))
-            store[name]["bacc"].append(downstream["bacc"])
-            store[name]["f1"].append(downstream["f1"])
-            store[name]["auc"].append(downstream["auc"])
-            store[name]["latency_ms"].append(downstream["latency_ms"])
-            store[name]["features"].append(float(knee.sum()))
-            store[name]["stability"].append(float(1.0 - ev.f_stab(knee)))
-            store[name]["evasion"].append(curve)
-        print(f"[run {run_idx + 1}/{cfg.n_runs}] done (seed={seed})")
-
-    return _aggregate_and_export(ds, cfg, methods, store, hv_logs,
-                                 amofs_selfreq_logs, run_ablation)
-
-
-def _aggregate_and_export(ds, cfg, methods, store, hv_logs, amofs_selfreq_logs, run_ablation):
-    agg: Dict[str, dict] = {}
-    evasion_mean: Dict[str, np.ndarray] = {}
-    raw_runs: Dict[str, dict] = {}
-    for method in methods:
-        agg[method] = {}
-        raw_runs[method] = {}
-        for key in ("hv", "igd", "bacc", "f1", "auc", "stability", "features", "latency_ms"):
-            vals = np.array(store[method][key], dtype=float)
-            raw_runs[method][key] = vals.tolist()
-            agg[method][f"{key}_mean"] = float(np.nanmean(vals))
-            agg[method][f"{key}_std"] = float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0
-        evasion_arr = np.vstack(store[method]["evasion"])
-        raw_runs[method]["evasion"] = evasion_arr.tolist()
-        evasion_mean[method] = np.nanmean(evasion_arr, axis=0)
-
-    name = ds.name
-    table_dir = os.path.join(RESULTS, "tables")
-    figure_dir = os.path.join(RESULTS, "figures")
-
-    export.main_comparison_table(methods, agg, os.path.join(table_dir, f"main_{name}.tex"))
-    export.extended_metrics_table(methods, agg, os.path.join(table_dir, f"extended_{name}.tex"))
-    export.evasion_table(methods, evasion_mean, os.path.join(table_dir, f"evasion_{name}.tex"))
-    export.dataset_table(_dataset_summary(ds, cfg), os.path.join(table_dir, f"dataset_{name}.tex"))
-    export.hyperparameter_table(_selected_hyperparameters(cfg), os.path.join(table_dir, f"hyper_{name}.tex"))
-
-    amofs_hv = np.array(store["AMOFS"]["hv"], dtype=float)
-    baseline_hv = {m: np.array(store[m]["hv"], dtype=float) for m in methods if m != "AMOFS"}
-    comp = compare_against_baselines(amofs_hv, baseline_hv, higher_is_better=True)
-    export.stats_table("HV", comp, os.path.join(table_dir, f"stats_hv_{name}.tex"))
-
-    ablation = {}
-    if run_ablation:
-        ablation = _ablation(ds, cfg)
-        order = ["Full AMOFS", "w/o ANCF", "w/o AGDM", "w/o ANCF \\& AGDM", "w/o $f_{\\mathrm{rob}}$ objective"]
-        export.ablation_table(ablation, order, os.path.join(table_dir, f"ablation_{name}.tex"))
-
-    _plot_convergence(hv_logs, amofs_selfreq_logs, figure_dir, name)
-
-    summary = dict(
-        dataset=_dataset_summary(ds, cfg),
-        config=asdict(cfg),
-        metrics=agg,
-        raw_runs=raw_runs,
-        evasion={m: evasion_mean[m].tolist() for m in methods},
-        hv_significance=comp,
-        ablation=ablation,
-        outputs=dict(tables=table_dir, figures=figure_dir),
-    )
-    os.makedirs(RESULTS, exist_ok=True)
-    summary_path = os.path.join(RESULTS, f"{name}_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, default=float)
-    print(f"[export] wrote {summary_path}")
-    return summary
-
-
-def _run_amofs_variant(ev: Evaluator, cfg: ExperimentConfig, params, seed: int,
-                       disabled_objectives: Tuple[int, ...] = ()):
-    search_ev = ObjectiveDropEvaluator(ev, disabled_objectives) if disabled_objectives else ev
-    res = run_amofs(search_ev, ev.ds.n_features, cfg.pop_size, cfg.generations, params, seed=seed)
-    full_F = _evaluate_archive(ev, res.arch_X)
-    return res.arch_X, full_F
-
-
-def _ablation(ds: Dataset, cfg: ExperimentConfig) -> Dict[str, dict]:
-    rows = {
-        "Full AMOFS": {"hv": [], "igd": [], "evasion3": []},
-        "w/o ANCF": {"hv": [], "igd": [], "evasion3": []},
-        "w/o AGDM": {"hv": [], "igd": [], "evasion3": []},
-        "w/o ANCF \\& AGDM": {"hv": [], "igd": [], "evasion3": []},
-        "w/o $f_{\\mathrm{rob}}$ objective": {"hv": [], "igd": [], "evasion3": []},
-    }
-
-    variants = []
-    full = deepcopy(cfg.amofs)
-    variants.append(("Full AMOFS", full, ()))
-    no_ancf = deepcopy(cfg.amofs); no_ancf.use_ancf = False
-    variants.append(("w/o ANCF", no_ancf, ()))
-    no_agdm = deepcopy(cfg.amofs); no_agdm.use_agdm = False
-    variants.append(("w/o AGDM", no_agdm, ()))
-    no_both = deepcopy(cfg.amofs); no_both.use_ancf = False; no_both.use_agdm = False
-    variants.append(("w/o ANCF \\& AGDM", no_both, ()))
-    no_rob = deepcopy(cfg.amofs)
-    variants.append(("w/o $f_{\\mathrm{rob}}$ objective", no_rob, (2,)))
-
-    for run_idx in range(cfg.ablation_runs):
-        seed = cfg.base_seed + 10_000 + run_idx
-        Xtr, Xva, Xte, ytr, yva, yte = _split(ds, cfg, seed)
-        ev = Evaluator(ds, Xtr, ytr, Xva, yva, k=cfg.knn_k,
-                       n_windows=cfg.n_windows, mec_delta=cfg.mec_delta)
-        Xtr_s, Xte_s = _standardised_test(ev, Xtr, Xte)
-        fronts = {}
-        for label, params, disabled in variants:
-            aX, aF = _run_amofs_variant(ev, cfg, params, seed, disabled)
-            fronts[label] = (aX, aF)
-        ref = build_reference_front([aF for _, aF in fronts.values()])
-        for label, (aX, aF) in fronts.items():
-            knee = _knee_subset(aX, aF, ds.n_features)
-            curve = evasion_curve(Xtr_s, ytr, Xte_s, yte, knee, ds.costs,
-                                  cfg.attack_budgets, seed=seed)
-            mid = min(2, len(curve) - 1)
-            rows[label]["hv"].append(hypervolume(aF))
-            rows[label]["igd"].append(igd(aF, ref))
-            rows[label]["evasion3"].append(float(curve[mid]))
-        print(f"[ablation {run_idx + 1}/{cfg.ablation_runs}] done (seed={seed})")
-
-    out = {}
-    for label, metrics in rows.items():
-        out[label] = {}
-        for key, values in metrics.items():
-            vals = np.array(values, dtype=float)
-            out[label][f"{key}_mean"] = float(np.nanmean(vals))
-            out[label][f"{key}_std"] = float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0
+def _score_subset(ev: Evaluator, mask: np.ndarray, cfg: ExperimentConfig, seed: int) -> dict:
+    sp = ev.split
+    atk = EvasionAttacker(ev.Xs[sp.tr], ev.y[sp.tr], ev.Xs[sp.te], ev.y[sp.te], mask, ev.costs,
+                          seed=seed, max_samples=cfg.attack_max_samples, hgb_max_iter=cfg.hgb_max_iter)
+    out = _detector_metrics(atk.deployed, ev.Xs[sp.te][:, atk.sel], ev.y[sp.te])
+    curves = atk.curves(cfg.attack_budgets)
+    out.update(evasion_transfer=curves["transfer"], evasion_direct=curves["direct"],
+               auec_transfer=auec(curves["transfer"], cfg.attack_budgets),
+               auec_direct=auec(curves["direct"], cfg.attack_budgets),
+               clean_detection=curves["clean_detection"],
+               features=float(mask.sum()), mec=ev.mec(mask),
+               temporal_stability=1.0 - ev.f_stab(mask), f_vec=ev.evaluate(mask).tolist())
     return out
 
 
-def _plot_convergence(hv_logs, selfreq_logs, figure_dir, name):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def run_one_seed(ds: Dataset, cfg: ExperimentConfig, seed: int, methods: Sequence[str]) -> dict:
+    split = chronological_split(ds, cfg.dev_fraction, cfg.val_fraction, seed)
+    ev = Evaluator(ds, split, k=cfg.knn_k, probe_train=cfg.probe_train, probe_val=cfg.probe_val,
+                   n_windows=cfg.n_windows, mec_delta=cfg.mec_delta, seed=seed)
+    d = ds.n_features
+    fronts: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    logs: Dict[str, list] = {}
+    runtime: Dict[str, float] = {}
+    amofs_res = None
+    for name in methods:
+        t0 = time.perf_counter()
+        if name == "AMOFS":
+            amofs_res = run_amofs(ev, d, cfg.pop_size, cfg.generations, cfg.amofs, seed=seed,
+                                  archive_cap=cfg.archive_cap)
+            fronts[name] = (amofs_res.arch_X, amofs_res.arch_F)
+            logs[name] = amofs_res.hv_log
+        else:
+            aX, aF, hv_log = BASELINES[name](ev, d, cfg.pop_size, cfg.generations, seed=seed,
+                                             archive_cap=cfg.archive_cap)
+            fronts[name] = (aX, aF)
+            logs[name] = hv_log
+        runtime[name] = time.perf_counter() - t0
 
-    os.makedirs(figure_dir, exist_ok=True)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-
-    for method, logs in hv_logs.items():
-        good = [np.asarray(log, dtype=float) for log in logs if len(log)]
-        if not good:
-            continue
-        min_len = min(len(log) for log in good)
-        arr = np.vstack([log[:min_len] for log in good])
-        mean = arr.mean(axis=0)
-        ci = 1.96 * arr.std(axis=0, ddof=1) / np.sqrt(arr.shape[0]) if arr.shape[0] > 1 else np.zeros_like(mean)
-        gens = np.arange(1, min_len + 1)
-        ax[0].plot(gens, mean, label=method, linewidth=1.4 if method == "AMOFS" else 1.0)
-        if method == "AMOFS":
-            ax[0].fill_between(gens, mean - ci, mean + ci, alpha=0.2)
-    ax[0].set_xlabel("generation")
-    ax[0].set_ylabel("archive hypervolume")
-    ax[0].set_title("Convergence")
-    ax[0].legend(fontsize=8)
-
-    if selfreq_logs:
-        min_len = min(log.shape[0] for log in selfreq_logs)
-        arr = np.stack([log[:min_len] for log in selfreq_logs], axis=0)
-        final_freq = arr[:, -1, :].mean(axis=0)
-        recovered = final_freq >= np.median(final_freq)
-        series = arr[:, :, recovered].mean(axis=2)
-        mean = series.mean(axis=0)
-        ci = 1.96 * series.std(axis=0, ddof=1) / np.sqrt(series.shape[0]) if series.shape[0] > 1 else np.zeros_like(mean)
-        gens = np.arange(1, min_len + 1)
-        gamma = float(np.min(final_freq[recovered])) if np.any(recovered) else 0.0
-        ax[1].plot(gens, mean, color="tab:blue")
-        ax[1].fill_between(gens, mean - ci, mean + ci, color="tab:blue", alpha=0.2)
-        ax[1].axhline(gamma, color="grey", linestyle="--", linewidth=1.0)
-        ax[1].text(gens[-1], gamma, f" gamma={gamma:.2f}", va="bottom", fontsize=8)
-    ax[1].set_xlabel("generation")
-    ax[1].set_ylabel("mean archive frequency")
-    ax[1].set_title("AGDM guidance evidence")
-
-    fig.tight_layout()
-    out = os.path.join(figure_dir, f"convergence_{name}.png")
-    fig.savefig(out, dpi=180)
-    plt.close(fig)
-    print(f"[export] wrote {out}")
-
-
-def _apply_cli_overrides(cfg: ExperimentConfig, args) -> ExperimentConfig:
-    if args.n_runs is not None:
-        cfg.n_runs = args.n_runs
-    if args.ablation_runs is not None:
-        cfg.ablation_runs = args.ablation_runs
-    if args.pop_size is not None:
-        cfg.pop_size = args.pop_size
-    if args.generations is not None:
-        cfg.generations = args.generations
-    if args.knn_k is not None:
-        cfg.knn_k = args.knn_k
-    if args.n_windows is not None:
-        cfg.n_windows = args.n_windows
-    if args.mec_delta is not None:
-        cfg.mec_delta = args.mec_delta
-    return cfg
+    ref = build_reference_front([F for _, F in fronts.values()])
+    out: dict = dict(seed=seed, n_train=int(len(split.tr)), n_val=int(len(split.va)),
+                     n_test=int(len(split.te)), dev_cutoff_ns=split.cutoff_ns,
+                     n_evaluations=ev.n_evaluations, methods={}, hv_logs=logs)
+    for name, (aX, aF) in fronts.items():
+        bal, acc = operating_point(aX, aF, ref)
+        m = dict(hv=hypervolume(aF, exact=True), igd=igd(aF, ref), archive_size=int(aX.shape[0]),
+                 runtime_s=runtime[name], mask=bal.tolist(), mask_acc=acc.tolist())
+        m.update(_score_subset(ev, bal, cfg, seed))
+        acc_scores = _score_subset(ev, acc, cfg, seed)
+        m.update(bacc_acc=acc_scores["bacc"], features_acc=acc_scores["features"],
+                 auec_direct_acc=acc_scores["auec_direct"])
+        out["methods"][name] = m
+    if amofs_res is not None:
+        sf = np.vstack(amofs_res.sel_freq_log)                       # (gens, d)
+        final = sf[-1]
+        S = final >= 0.5
+        gamma_t = np.minimum((2 * sf[:, S] - 1).min(axis=1) if S.any() else np.zeros(sf.shape[0]),
+                             (1 - 2 * sf[:, ~S]).min(axis=1) if (~S).any() else np.zeros(sf.shape[0]))
+        out["amofs"] = dict(gamma_hat=float(gamma_t[-1]), gamma_hat_traj=gamma_t.tolist(),
+                            a_log=amofs_res.a_log, eta_log=amofs_res.eta_log,
+                            archive_size_log=amofs_res.archive_size_log,
+                            truncations=amofs_res.truncations, final_sel_freq=final.tolist(),
+                            consensus_support=np.flatnonzero(S).tolist())
+    return out
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", help="path to a feature CSV")
-    parser.add_argument("--name", default="dataset")
-    parser.add_argument("--synthetic", action="store_true", help="run full config on synthetic data")
-    parser.add_argument("--smoke", action="store_true", help="fast synthetic pipeline check")
-    parser.add_argument("--n-runs", type=int)
-    parser.add_argument("--ablation-runs", type=int)
-    parser.add_argument("--pop-size", type=int)
-    parser.add_argument("--generations", type=int)
-    parser.add_argument("--knn-k", type=int)
-    parser.add_argument("--n-windows", type=int)
-    parser.add_argument("--mec-delta", type=float)
-    parser.add_argument("--no-ablation", action="store_true")
-    args = parser.parse_args()
+def run_ablation_seed(ds: Dataset, cfg: ExperimentConfig, seed: int) -> dict:
+    split = chronological_split(ds, cfg.dev_fraction, cfg.val_fraction, seed)
+    ev = Evaluator(ds, split, k=cfg.knn_k, probe_train=cfg.probe_train, probe_val=cfg.probe_val,
+                   n_windows=cfg.n_windows, mec_delta=cfg.mec_delta, seed=seed)
+    fronts = {}
+    for label, overrides, disabled in ABLATION_VARIANTS:
+        params = deepcopy(cfg.amofs)
+        for k, v in overrides.items():
+            setattr(params, k, v)
+        search_ev = ObjectiveDropEvaluator(ev, disabled) if disabled else ev
+        res = run_amofs(search_ev, ds.n_features, cfg.pop_size, cfg.generations, params, seed=seed,
+                        archive_cap=cfg.archive_cap)
+        aF = ev.evaluate_population(res.arch_X)                   # re-score on all four objectives
+        fronts[label] = (res.arch_X, aF)
+    ref = build_reference_front([F for _, F in fronts.values()])
+    out = dict(seed=seed, variants={})
+    for label, (aX, aF) in fronts.items():
+        bal, _ = operating_point(aX, aF, ref)
+        m = dict(hv=hypervolume(aF, exact=True), igd=igd(aF, ref))
+        m.update(_score_subset(ev, bal, cfg, seed))
+        out["variants"][label] = m
+    return out
+
+
+# ---------------------------------------------------------------------------
+def _mean_std(values: Sequence[float]) -> dict:
+    v = np.asarray(values, dtype=float)
+    return dict(mean=float(np.nanmean(v)) if v.size else float("nan"),
+                std=float(np.nanstd(v, ddof=1)) if v.size > 1 else 0.0, values=v.tolist())
+
+
+def _curve_stats(curves: Sequence[Sequence[float]]) -> dict:
+    arr = np.asarray(curves, dtype=float)
+    return dict(mean=arr.mean(axis=0).tolist(),
+                std=(arr.std(axis=0, ddof=1) if arr.shape[0] > 1 else np.zeros(arr.shape[1])).tolist())
+
+
+def _pairwise_jaccard(masks: Sequence[Sequence[int]]) -> float:
+    M = np.asarray(masks, dtype=bool)
+    if M.shape[0] < 2:
+        return float("nan")
+    vals = []
+    for i in range(M.shape[0]):
+        for j in range(i + 1, M.shape[0]):
+            u = (M[i] | M[j]).sum()
+            vals.append((M[i] & M[j]).sum() / u if u else 1.0)
+    return float(np.mean(vals))
+
+
+def _mean_ci(logs: Sequence[Sequence[float]]) -> dict:
+    good = [np.asarray(l, dtype=float) for l in logs if len(l) > 1]
+    if not good:
+        return {}
+    L = min(len(l) for l in good)
+    arr = np.vstack([l[:L] for l in good])
+    ci = 1.96 * arr.std(axis=0, ddof=1) / np.sqrt(arr.shape[0]) if arr.shape[0] > 1 else np.zeros(L)
+    return dict(mean=arr.mean(axis=0).tolist(), ci=ci.tolist())
+
+
+def aggregate(ds: Dataset, cfg: ExperimentConfig, seeds: List[dict], abl: List[dict],
+              tag: str, display: str) -> dict:
+    methods = [m for m in METHOD_ORDER if m in seeds[0]["methods"]]
+    scalar_keys = ("hv", "igd", "archive_size", "runtime_s", "bacc", "f1", "auc", "features", "mec",
+                   "temporal_stability", "auec_transfer", "auec_direct", "clean_detection",
+                   "bacc_acc", "features_acc", "auec_direct_acc")
+    metrics, run_stab, tier_share = {}, {}, {}
+    tiers = np.asarray(ds.tiers)
+    for m in methods:
+        rows = [s["methods"][m] for s in seeds]
+        metrics[m] = {k: _mean_std([r[k] for r in rows]) for k in scalar_keys}
+        metrics[m]["evasion_transfer"] = _curve_stats([r["evasion_transfer"] for r in rows])
+        metrics[m]["evasion_direct"] = _curve_stats([r["evasion_direct"] for r in rows])
+        masks = [r["mask"] for r in rows]
+        run_stab[m] = _pairwise_jaccard(masks)
+        sel = np.asarray(masks, dtype=bool)
+        counts = sel.sum(axis=1).astype(float)
+        tier_share[m] = {t: float(np.mean([(sel[i] & (tiers == t)).sum() / c if c else 0.0
+                                           for i, c in enumerate(counts)]))
+                         for t in ("cheap", "moderate", "expensive")}
+    tests, fried = {}, {}
+    for metric, higher in (("hv", True), ("igd", False), ("bacc", True), ("auc", True),
+                           ("auec_direct", False), ("auec_transfer", False), ("features", False)):
+        base = {m: np.asarray(metrics[m][metric]["values"]) for m in methods if m != "AMOFS"}
+        tests[metric] = compare_against_baselines(np.asarray(metrics["AMOFS"][metric]["values"]), base, higher)
+        fried[metric] = friedman({m: metrics[m][metric]["values"] for m in methods})
+
+    convergence = {m: _mean_ci([s["hv_logs"][m] for s in seeds]) for m in methods}
+    diag = {}
+    if "amofs" in seeds[0]:
+        diag["gamma_hat"] = _mean_std([s["amofs"]["gamma_hat"] for s in seeds])
+        diag["gamma_hat_traj"] = _mean_ci([s["amofs"]["gamma_hat_traj"] for s in seeds])
+        diag["a_mean"] = _mean_ci([s["amofs"]["a_log"] for s in seeds]).get("mean", [])
+        diag["eta_mean"] = _mean_ci([s["amofs"]["eta_log"] for s in seeds]).get("mean", [])
+        diag["archive_size_mean"] = _mean_ci([s["amofs"]["archive_size_log"] for s in seeds]).get("mean", [])
+        diag["truncations_total"] = int(sum(s["amofs"]["truncations"] for s in seeds))
+        freq = np.mean([s["amofs"]["final_sel_freq"] for s in seeds], axis=0)
+        diag["final_sel_freq_mean"] = freq.tolist()
+        diag["feature_names"] = ds.feature_names
+        if convergence.get("NSGA-II") and convergence.get("AMOFS"):
+            target = convergence["NSGA-II"]["mean"][-1]
+            hit = [i + 1 for i, v in enumerate(convergence["AMOFS"]["mean"]) if v >= target]
+            diag["gens_to_match_nsga2"] = hit[0] if hit else None
+
+    ablation = {}
+    if abl:
+        for label, _, _ in ABLATION_VARIANTS:
+            rows = [a["variants"][label] for a in abl if label in a["variants"]]
+            if rows:
+                ablation[label] = {k: _mean_std([r[k] for r in rows])
+                                   for k in ("hv", "igd", "bacc", "features", "auec_direct",
+                                             "auec_transfer", "temporal_stability", "mec")}
+    s0 = seeds[0]
+    first = np.datetime64(int(ds.t[0]), "ns").astype("datetime64[D]")
+    last = np.datetime64(int(ds.t[-1]), "ns").astype("datetime64[D]")
+    cutoff = np.datetime64(int(s0["dev_cutoff_ns"]), "ns").astype("datetime64[D]")
+    n_dev = s0["n_train"] + s0["n_val"]
+    dataset = dict(name=ds.name, tag=tag, display_name=display, n_urls=int(len(ds.y)),
+                   malicious_pct=float(100 * ds.y.mean()), n_features=ds.n_features, windows=cfg.n_windows,
+                   first_seen=str(first), last_seen=str(last), dev_cutoff=str(cutoff),
+                   n_dev=int(n_dev), n_train=s0["n_train"], n_val=s0["n_val"], n_test=s0["n_test"],
+                   test_malicious_pct=float(100 * ds.y[n_dev:].mean()),
+                   tier_counts={t: int((tiers == t).sum()) for t in ("cheap", "moderate", "expensive")})
+    return dict(dataset=dataset, config=cfg.to_dict(), hv_backend=hv_backend(), methods=methods,
+                n_seeds=len(seeds), n_ablation_seeds=len(abl), metrics=metrics, run_stability=run_stab,
+                tier_share=tier_share, tests=tests, friedman=fried, convergence=convergence,
+                amofs_diagnostics=diag, ablation=ablation,
+                operating_masks={m: [s["methods"][m]["mask"] for s in seeds] for m in methods})
+
+
+# ---------------------------------------------------------------------------
+def _load_or_run(path: str, fn, resume: bool, *args):
+    if resume and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    res = fn(*args)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(res, f, default=float)
+    return res
+
+
+def run_experiment(ds: Dataset, cfg: ExperimentConfig, tag: str, display: str, methods: Sequence[str],
+                   run_ablation: bool = True, resume: bool = True, aggregate_only: bool = False) -> dict:
+    out_dir = os.path.join(RESULTS, tag)
+    seed_dir, abl_dir = os.path.join(out_dir, "seeds"), os.path.join(out_dir, "ablation")
+    n_jobs = cfg.n_jobs if cfg.n_jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
+    seeds_list = [cfg.base_seed + i for i in range(cfg.n_runs)]
+    abl_list = [cfg.base_seed + 10_000 + i for i in range(cfg.ablation_runs)] if run_ablation else []
+
+    if aggregate_only:
+        seed_res = [json.load(open(os.path.join(seed_dir, f"seed_{s}.json"), encoding="utf-8"))
+                    for s in seeds_list if os.path.exists(os.path.join(seed_dir, f"seed_{s}.json"))]
+        abl_res = [json.load(open(os.path.join(abl_dir, f"seed_{s}.json"), encoding="utf-8"))
+                   for s in abl_list if os.path.exists(os.path.join(abl_dir, f"seed_{s}.json"))]
+    else:
+        print(f"[run] {ds.name}: n={len(ds.y)}, d={ds.n_features}, {cfg.n_runs} seeds x {len(methods)} methods, "
+              f"pop={cfg.pop_size}, gens={cfg.generations}, workers={n_jobs}, HV backend={hv_backend()}")
+        t0 = time.time()
+        seed_res = Parallel(n_jobs=n_jobs, verbose=5)(
+            delayed(_load_or_run)(os.path.join(seed_dir, f"seed_{s}.json"), run_one_seed, resume,
+                                  ds, cfg, s, list(methods))
+            for s in seeds_list)
+        print(f"[run] main comparison done in {(time.time() - t0) / 60:.1f} min")
+        abl_res = []
+        if run_ablation:
+            t0 = time.time()
+            abl_res = Parallel(n_jobs=n_jobs, verbose=5)(
+                delayed(_load_or_run)(os.path.join(abl_dir, f"seed_{s}.json"), run_ablation_seed, resume,
+                                      ds, cfg, s)
+                for s in abl_list)
+            print(f"[run] ablation done in {(time.time() - t0) / 60:.1f} min")
+
+    summary = aggregate(ds, cfg, seed_res, abl_res, tag, display) if seed_res else None
+    if summary is None:
+        raise SystemExit(f"no seed results found under {seed_dir}; run without --aggregate-only first")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=1, default=float)
+    export.write_all(summary, os.path.join(out_dir, "tables"))
+    print(f"[export] {out_dir}/summary.json and tables/ written")
+    _print_brief(summary)
+    return summary
+
+
+def _print_brief(summary: dict) -> None:
+    print(f"\n{summary['dataset']['display_name']}  (seeds={summary['n_seeds']})")
+    print(f"{'method':14s} {'HV':>7s} {'IGD':>7s} {'BACC':>7s} {'|x|':>6s} {'AUEC-dir':>9s} {'AUEC-tr':>8s}")
+    for m in summary["methods"]:
+        M = summary["metrics"][m]
+        print(f"{m:14s} {M['hv']['mean']:7.3f} {M['igd']['mean']:7.3f} {M['bacc']['mean']:7.3f} "
+              f"{M['features']['mean']:6.1f} {M['auec_direct']['mean']:9.3f} {M['auec_transfer']['mean']:8.3f}")
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", help="processed feature CSV")
+    p.add_argument("--tag", default="DS", help="short identifier used in file and macro names (letters only)")
+    p.add_argument("--display", default=None, help="corpus name shown in tables")
+    p.add_argument("--profile", default="fast", choices=sorted(PROFILES))
+    p.add_argument("--smoke", action="store_true", help="synthetic data, tiny budget, pipeline check")
+    p.add_argument("--methods", default=",".join(METHOD_ORDER))
+    p.add_argument("--n-runs", type=int)
+    p.add_argument("--ablation-runs", type=int)
+    p.add_argument("--pop-size", type=int)
+    p.add_argument("--generations", type=int)
+    p.add_argument("--n-windows", type=int)
+    p.add_argument("--mec-delta", type=float)
+    p.add_argument("--n-jobs", type=int)
+    p.add_argument("--no-ablation", action="store_true")
+    p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--aggregate-only", action="store_true")
+    args = p.parse_args(argv)
 
     if args.smoke:
         cfg = ExperimentConfig.smoke()
-        ds = make_synthetic(n_samples=500, n_features=20, seed=0, name="smoke")
-    elif args.synthetic:
-        cfg = ExperimentConfig()
-        ds = make_synthetic(name="synthetic")
+        ds = make_synthetic(n_samples=800, n_features=20, seed=0, name="smoke")
+        tag, display = "SMOKE", "Synthetic smoke test"
     else:
         if not args.dataset:
-            raise SystemExit("provide --dataset PATH or use --smoke/--synthetic")
-        cfg = ExperimentConfig()
-        ds = load_dataset(args.dataset, args.name)
-
-    cfg = _apply_cli_overrides(cfg, args)
-    run_experiment(ds, cfg, run_ablation=not args.no_ablation)
+            raise SystemExit("provide --dataset PATH or --smoke")
+        cfg = PROFILES[args.profile]()
+        ds = load_dataset(args.dataset, os.path.splitext(os.path.basename(args.dataset))[0])
+        tag, display = args.tag, args.display or ds.name
+    for attr in ("n_runs", "ablation_runs", "pop_size", "generations", "n_windows", "mec_delta", "n_jobs"):
+        v = getattr(args, attr)
+        if v is not None:
+            setattr(cfg, attr, v)
+    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    if "AMOFS" not in methods:
+        methods.append("AMOFS")
+    run_experiment(ds, cfg, tag, display, methods, run_ablation=not args.no_ablation,
+                   resume=not args.no_resume, aggregate_only=args.aggregate_only)
 
 
 if __name__ == "__main__":

@@ -1,58 +1,79 @@
-"""Quality indicators: hypervolume (HV) and inverted generational distance (IGD).
+"""Quality indicators: hypervolume (exact when pymoo is installed, otherwise
+scrambled-Sobol quasi-Monte-Carlo with a fixed seed) and IGD.
 
-All objectives are minimised and bounded in [0, 1], so the reference point for
-HV is (1, 1, 1, 1). HV is computed by Monte-Carlo estimation, which is exact in
-expectation and dimension-agnostic; for the four-objective setting this is both
-simple and accurate enough at the sample sizes used here.
+All objectives are minimised and lie in [0, 1]; the HV reference point is
+(1, ..., 1), so HV is the fraction of the unit box dominated by the front.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .nsga_common import non_dominated
+from .nsga_common import non_dominated_mask
+
+try:  # exact hypervolume
+    from pymoo.indicators.hv import HV as _PymooHV  # type: ignore
+
+    _HAVE_PYMOO = True
+except Exception:  # pragma: no cover
+    _HAVE_PYMOO = False
+
+try:
+    from scipy.stats import qmc as _qmc  # type: ignore
+except Exception:  # pragma: no cover
+    _qmc = None
+
+_QMC_CACHE: dict = {}
 
 
-def hypervolume(F: np.ndarray, ref: np.ndarray = None,
-                n_mc: int = 5_000, seed: int = 0) -> float:
-    """Monte-Carlo hypervolume of the dominated region below ``ref``.
+def _qmc_points(m: int, n_pts: int, seed: int) -> np.ndarray:
+    key = (m, n_pts, seed)
+    if key not in _QMC_CACHE:
+        if _qmc is not None:
+            sampler = _qmc.Sobol(d=m, scramble=True, seed=seed)
+            pts = sampler.random_base2(int(np.ceil(np.log2(n_pts))))
+        else:
+            pts = np.random.default_rng(seed).random((n_pts, m))
+        _QMC_CACHE[key] = pts
+    return _QMC_CACHE[key]
 
-    Returns the fraction of the box [0, ref] dominated by at least one point of
-    the (non-dominated) front F, i.e. HV normalised to [0, 1].
+
+def hypervolume(F: np.ndarray, exact: bool = True, n_qmc: int = 2 ** 15, seed: int = 0) -> float:
+    """HV of front ``F`` w.r.t. reference point 1.
+
+    ``exact=False`` is used inside the search loop (ANCF progress signal) where
+    a fast, consistent estimate is enough; the reported indicator always uses
+    ``exact=True`` (pymoo exact algorithm, or a 2^17-point QMC estimate when
+    pymoo is unavailable).
     """
     if F.shape[0] == 0:
         return 0.0
-    m = F.shape[1]
-    if ref is None:
-        ref = np.ones(m)
-    # restrict to points inside the box and non-dominated
-    inside = np.all(F <= ref, axis=1)
-    F = F[inside]
+    F = F[np.all(F <= 1.0, axis=1)]
     if F.shape[0] == 0:
         return 0.0
-    rng = np.random.default_rng(seed)
-    samples = rng.uniform(low=0.0, high=ref, size=(n_mc, m))
-    # a sample is dominated if some front point is <= it in all objectives
-    dominated = np.zeros(n_mc, dtype=bool)
-    for p in F:
-        dominated |= np.all(p <= samples, axis=1)
-    vol_box = float(np.prod(ref))
-    return float(dominated.mean() * vol_box)
+    F = F[non_dominated_mask(F)]
+    m = F.shape[1]
+    if exact and _HAVE_PYMOO:
+        return float(_PymooHV(ref_point=np.ones(m))(F))
+    pts = _qmc_points(m, 2 ** 17 if exact else n_qmc, seed)
+    dominated = np.zeros(pts.shape[0], dtype=bool)
+    for s in range(0, F.shape[0], 64):
+        blk = F[s:s + 64]
+        dominated |= np.any(np.all(blk[:, None, :] <= pts[None, :, :], axis=2), axis=0)
+    return float(dominated.mean())
 
 
 def igd(F: np.ndarray, reference_front: np.ndarray) -> float:
-    """Inverted generational distance from ``reference_front`` to F (lower better)."""
     if F.shape[0] == 0 or reference_front.shape[0] == 0:
         return float("inf")
-    dists = []
-    for r in reference_front:
-        d = np.sqrt(np.sum((F - r) ** 2, axis=1))
-        dists.append(d.min())
-    return float(np.mean(dists))
+    d = np.sqrt(((reference_front[:, None, :] - F[None, :, :]) ** 2).sum(2))
+    return float(d.min(axis=1).mean())
 
 
-def build_reference_front(fronts: list) -> np.ndarray:
-    """Union of several methods' fronts, reduced to its non-dominated points."""
+def build_reference_front(fronts) -> np.ndarray:
     allF = np.vstack([f for f in fronts if f.shape[0] > 0])
-    dummyX = np.zeros((allF.shape[0], 1))
-    _, ndF = non_dominated(dummyX, allF)
-    return ndF
+    allF = np.unique(allF, axis=0)
+    return allF[non_dominated_mask(allF)]
+
+
+def hv_backend() -> str:
+    return "pymoo-exact" if _HAVE_PYMOO else "sobol-qmc-2^17"

@@ -1,0 +1,16 @@
+{
+  "path": "C:\\Users\\Administrator\\Desktop\\\u8bba\u6587\\\u6076\u610fURL\u68c0\u6d4b\uff08\u5df2\u6295\uff09\\code\\data\\processed\\phishtank_hn.csv",
+  "rows": 45000,
+  "malicious": 15000,
+  "malicious_pct": 33.33333333333333,
+  "n_features": 67,
+  "first_seen": "2023-01-02",
+  "last_seen": "2026-11-18",
+  "malicious_source": "csv",
+  "benign_source": "hn",
+  "urlhaus_variant": null,
+  "benign_ratio": 2.0,
+  "align_bins": 24,
+  "retrieved_utc": "2026-11-19T03:12:00+00:00",
+  "note": "Benign HN links are sampled bin-by-bin to match the malicious first-seen distribution; exact-URL duplicates removed; hosts shared across labels kept."
+}
